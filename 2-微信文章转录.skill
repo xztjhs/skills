@@ -1,0 +1,55 @@
+---
+name: wx_article
+description: "提取微信公众号文章内容为 Markdown 文件保存。"
+---
+
+# 微信公众号文章提取
+
+将微信公众号文章 URL 对应的正文提取为 Markdown，保存到指定目录。
+
+## 触发条件
+
+- 用户提供微信公众号文章链接（`mp.weixin.qq.com`）
+- 需要把微信文章保存为本地 Markdown 归档
+
+## 依赖
+
+```bash
+pip install beautifulsoup4 requests lxml markdownify
+```
+
+## 用法
+
+### 方式一：直接调用脚本
+
+```bash
+python skills/wx_article/scripts/extract.py <URL> [--out-dir <目录>]
+```
+
+### 方式二：Agent 调用流程
+
+1. 拿到用户提供的文章 URL
+2. 执行提取脚本：
+   ```bash
+   python skills/wx_article/scripts/extract.py "<URL>" --out-dir /root/work/article
+   ```
+3. 向用户返回保存的文件路径
+
+## 输出格式
+
+```
+/root/work/article/
+  YYYY-MM-DD_公众号名称_文章名称.md
+```
+
+文件包含 YAML frontmatter（title、author、date、source）和 Markdown 正文。
+
+## 限制
+
+- 微信文章需要公网可访问，不支持需要登录或授权查看的链接
+- 部分图片带有微信防盗链，保存的图片链接在部分环境可能无法直接浏览
+- 复杂的排版（如表格、特殊样式）会简化处理
+
+## 脚本位置
+
+`scripts/extract.py`（同一目录下）
