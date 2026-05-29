@@ -1,0 +1,104 @@
+---
+name: InspurPPT_create
+description: "基于 IEIT 或 Inspur 母版模板生成专业 PPTX 演示文稿。"
+---
+
+# PPT 生成器
+
+基于预解析的 IEIT / Inspur 母版模板，按 7 步工作流生成专业 PPT。
+
+## 模板特性
+
+### IEIT.pptx（深色科技风）
+- 背景：深蓝/青绿渐变、纯黑、抽象城市线框
+- 字体颜色：白色 `#FFFFFF`、`#00F6FD` 亮青色、`#00FFFF`、数据来源 `#AAAAAA`（高对比度适配深色背景）
+- 字体：思源黑体 CN Medium, Microsoft YaHei
+- 布局（7种）：
+  | idx | 名称 | 用途 | 关键占位符 |
+  |---|---|---|---|
+  | 0 | 封面 | 封面 | CENTER_TITLE(主标题 idx=0) + BODY(演讲者信息 idx=14) + BODY(时间 idx=13) |
+  | 1 | 目录页 | 目录 | TITLE(占位符 idx=0，手动清空后用 add_textbox 放标题) |
+  | 2 | 章节标题页 | 章节过渡 | TITLE(章节名 idx=0) + BODY(副标题/概述 idx=12) |
+  | 3 | 内容页 | 纯文字内容 | TITLE(标题 idx=0) + BODY(正文大框 idx=13) + SLIDE_NUMBER(idx=12) |
+  | 4 | 内容页_图表 | 图表/混排内容 | TITLE(标题 idx=0) + OBJECT(内容区 idx=13) + SLIDE_NUMBER(idx=12) |
+  | 5 | 内容页_混合 | 复杂左右混排 | TITLE(标题 idx=0) + BODY(左半 idx=14) + OBJECT(右半 idx=13) |
+  | 6 | 封底 | 感谢页 | TITLE(感谢语 idx=0) |
+- 内容页预置：图片占位区、图表区、表格区、矩形装饰、IEIT SYSTEMS 品牌条
+- 底部固定：IEIT SYSTEMS + 蓝色城市线框装饰条
+- **关键陷阱（已踩过）**：
+  - **type vs idx 混淆**：`ph.type` 和 `ph.idx` 会撞值。填充时必须**严格按 idx** 匹配，不能靠 type 兜底，否则会把正文灌进标题区。
+  - **预置 demo 内容残留**：模板里每个 layout 都带 demo 内容。新建 slide 后需清空 idx=1（右上辅助小框）等辅助占位符。
+  - **内容页大框类型不一致**：layout 3 的 idx=13 是 BODY(可填文本)，layout 4/5 的 idx=13 是 OBJECT(只能放图表/图片，不能填文本)。正文在所有情况下都用手动文本框添加，不依赖这个大框占位符。
+- 使用场景：技术汇报、产品发布、前沿科技演讲
+
+### Inspur.pptx（白色商务风）
+- 背景：白色/浅色
+- 字体颜色：`#4D4D4D`、`#1A1A1A`、`#333333`、`#0D48CE` Logo蓝
+- 字体：微软雅黑、Source Han Sans SC、Arial
+- 布局：仅 "1_标题幻灯片" 单一布局，通过手动排版实现不同页面
+- 底部固定：Inspur 装饰元素
+- 使用场景：商务汇报、合作建议、企业介绍
+
+## 工作流
+
+1. **解析模板** — 已预分析，脚本直接按模板结构填充；启动时自动清除模板中的示例幻灯片
+2. **选择模板** — 询问用户用 IEIT 还是 Inspur，并说明风格差异
+3. **内容理解** — 用户输入主题/需求，大模型深度理解，必要时用 web_search 搜索补充
+4. **大纲生成** — 输出结构化大纲（封面、目录、章节×N、内容页×M、封底），要求用户确认
+5. **内容填充** — 基于大纲和搜索结果丰富每页内容，规划图表/图片位置
+6. **排版优化** — 参考现代办公汇报风格优化图文混排
+7. **生成文件** — 输出 `YYYY-MM-DD-主题-IEIT/Inspur-vN.pptx`
+
+## 脚本
+
+`scripts/generate_ppt.py` 接收 JSON 内容描述，生成最终 PPTX。
+
+运行命令：
+```bash
+python3 ~/work/skills/InspurPPT_create/scripts/generate_ppt.py /path/to/content.json /path/to/output.pptx
+```
+
+JSON 格式见 `references/content_format.md`。
+
+## 中间文件管理
+
+- **内容 JSON（中间产物）**：Agent 在工作流步骤 3-4 中生成的内容描述 JSON，统一保存到 **`~/work/ppt/temp/json/`** 下，命名格式：`ppt_<主题关键词>.json`
+- **临时图表 PNG**：`~/work/ppt/temp/charts/`
+- **临时下载图片**：`~/work/ppt/temp/images/`
+- 脚本启动时自动创建上述目录
+
+## 内容生成规则
+
+- **封面**：大标题（idx=0）+ 演讲者信息（idx=14，可选）+ 时间（idx=13，可选），不使用副标题，严格使用母版占位符
+- **目录**："目录"标题用手动文本框（字号36，与母版左对齐，适当上移），下方条目纵向排列并与标题保持左对齐
+- **章节标题页**：章节名 + 一句话概述
+- **内容页**：
+  - `title`：**页面主标题**，应为当页内容的**概要或核心介绍**（1行以内，让观众5秒抓住重点）
+  - `subtitle`：**章节名**，用于标识当前页所属章节（如"AI算力市场概览"），保持该章节下所有内容页的 `subtitle` 相同
+  - 每页聚焦 1 个核心观点
+  - **涉及数据的内容页，必须提取数据生成图表**：柱状图(bar)、饼图(pie)、折线图(line)、水平条形图(horizontal_bar)、环形图(doughnut)。图表配色使用高饱和度亮色，确保深色背景上对比度明显
+  - 数据标注来源
+  - 适当插入配图（搜索或本地）
+- **封底**：感谢语 + 联系方式/标语
+
+## 技术说明
+
+- IEIT 模板占位符丰富，优先用 `fill_placeholder` 填充；兜底时手动添加文本框
+- Inspur 模板无标准占位符，在空白布局上手动 `add_textbox` 和 `add_picture`
+- **图表配色与安全机制**：自动生成 PNG 图表，自动感知模板背景色
+  - IEIT（深色背景）：图表文字/坐标轴用白色 `#FFFFFF`，数据系列用高饱和度亮色多色系（`#00F6FD`、`#FF6B6B`、`#FFE15D`、`#4ECDC4`、`#C084FC`、`#FF8C42` 等），**严禁使用暗灰/近黑颜色**，否则在深色背景上完全看不见。
+  - Inspur（白色背景）：图表文字/坐标轴用深灰 `#333333`，数据系列用商务蓝绿红多色系（`#0D48CE`、`#00B4D8`、`#FF6B35`、`#2EC4B6` 等）
+  - **数据标签可读性保障**：
+    - 柱状图/水平条形图：数据标签统一加 **深色半透明圆角底框**（`facecolor="black", alpha=0.85`）+ 白字，确保在任何亮色柱子上都清晰。
+    - 饼图/环形图：`autopct` 百分比文字统一用白字 + **深色描边**（`path_effects.withStroke`），确保在任何扇区上都清晰可辨。
+  - **低对比度颜色自动拦截**：脚本内置 `ColorPalette.validate_colors()`，检测输入颜色与背景对比度。若低于阈值（WCAG 3:1），自动替换为模板推荐的高对比度安全色。
+- 图表类型支持：bar（柱状图）、horizontal_bar（水平条形图）、pie（饼图）、line（折线图）、doughnut（环形图），均支持多颜色区分数据项
+- **输出目录规则**：
+  - 生成的 PPT **默认保存到 `~/work/` 下**（命名格式：`YYYY-MM-DD-主题-IEIT/Inspur-vN.pptx`）
+  - 内容描述 JSON 等中间产物统一放到 **`~/work/ppt/temp/json/`** 下
+  - 生成过程中的临时文件（图表 PNG、下载图片等）统一放到 **`~/work/ppt/temp/`** 下
+    - 内容 JSON → `~/work/ppt/temp/json/`
+    - 图表 → `~/work/ppt/temp/charts/`
+    - 下载图片 → `~/work/ppt/temp/images/`
+  - 脚本启动时自动创建上述目录，无需手动准备
+- 版本号从 v1 开始；若文件已存在则递增
