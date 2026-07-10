@@ -42,7 +42,7 @@ python skills/wx_article/scripts/extract.py <URL> [--out-dir <目录>] [--no-bas
   年-月-日_文章标题_公众号名称.md
 ```
 
-文件首行为微信原文链接，包含 YAML frontmatter（title、author、date、source、cover）和 Markdown 正文，以及转录统计。
+文件包含 YAML frontmatter（title、author、date、source、cover）和 Markdown 正文，以及转录统计。
 
 ## 增强特性
 
