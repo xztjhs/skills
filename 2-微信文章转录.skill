@@ -1,6 +1,6 @@
 ---
 name: wx_article
-description: "提取微信公众号文章内容为 Markdown 文件保存。"
+description: "提取微信公众号文章内容为 Markdown 文件保存（增强版：重试机制、图片 base64 内嵌、视频/GIF 链接保留、可读性优化）。"
 ---
 
 # 微信公众号文章提取
@@ -23,7 +23,7 @@ pip install beautifulsoup4 requests lxml markdownify
 ### 方式一：直接调用脚本
 
 ```bash
-python skills/wx_article/scripts/extract.py <URL> [--out-dir <目录>]
+python skills/wx_article/scripts/extract.py <URL> [--out-dir <目录>] [--no-base64]
 ```
 
 ### 方式二：Agent 调用流程
@@ -33,23 +33,34 @@ python skills/wx_article/scripts/extract.py <URL> [--out-dir <目录>]
    ```bash
    python skills/wx_article/scripts/extract.py "<URL>" --out-dir /root/work/article
    ```
-3. 向用户返回保存的文件路径
+3. 向用户返回保存的文件路径和转录统计
 
 ## 输出格式
 
 ```
-/root/work/article/
-  YYYY-MM-DD_公众号名称_文章名称.md
+~/work/wx_articles/
+  年-月-日_文章标题_公众号名称.md
 ```
 
-文件包含 YAML frontmatter（title、author、date、source）和 Markdown 正文。
+文件首行为微信原文链接，包含 YAML frontmatter（title、author、date、source、cover）和 Markdown 正文，以及转录统计。
+
+## 增强特性
+
+| 特性 | 说明 |
+|---|---|
+| **重试机制** | 3 次指数退避重试，自动处理 429/500/502/503/504 |
+| **验证页检测** | 识别"请在微信客户端打开"等拦截页面，给出明确提示 |
+| **图片 base64 内嵌** | 下载图片并转为 base64 data URI，解决微信防盗链问题 |
+| **视频/GIF 链接保留** | 视频提取为 `[视频] URL` 文本，GIF 保留原链接 |
+| **可读性优化** | 清理空段落、规范化表格、保留引用块结构、智能 span unwrap |
+| **转录统计** | 文件末尾附转换统计数据 |
 
 ## 限制
 
 - 微信文章需要公网可访问，不支持需要登录或授权查看的链接
-- 部分图片带有微信防盗链，保存的图片链接在部分环境可能无法直接浏览
-- 复杂的排版（如表格、特殊样式）会简化处理
+- 超过 2MB 的图片放弃 base64 转换，保留原链接
+- 复杂的特殊排版（如交互式组件、小程序卡片）会简化处理
 
 ## 脚本位置
 
-`scripts/extract.py`（同一目录下）
+`scripts/extract.py`
