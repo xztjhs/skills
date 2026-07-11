@@ -1,66 +1,216 @@
 ---
 name: wx_article
-description: "提取微信公众号文章内容为 Markdown 文件保存（增强版：重试机制、图片 base64 内嵌、视频/GIF 链接保留、可读性优化）。"
+description: "提取微信公众号文章内容为 Markdown 文件保存（OpenClaw Skill 版本：重试机制、图片 base64 内嵌、视频/GIF 链接保留、可读性优化、日志系统、环境变量配置）。"
+version: "2.0.0"
+author: "xztjhs"
+license: "MIT"
 ---
 
 # 微信公众号文章提取
 
-将微信公众号文章 URL 对应的正文提取为 Markdown，保存到指定目录。
+将微信公众号文章 URL 对应的正文提取为 Markdown 文件保存。
 
-## 触发条件
+## 特点
 
-- 用户提供微信公众号文章链接（`mp.weixin.qq.com`）
-- 需要把微信文章保存为本地 Markdown 归档
+- **重试机制**：3 次指数退避重试，自动处理 429/500/502/503/504
+- **验证页检测**：识别"请在微信客户端打开"等拦截页面
+- **图片 base64 内嵌**：下载图片转为 base64 data URI，解决微信防盗链
+- **视频/GIF 链接保留**：视频提取为 `[视频] URL` 文本
+- **可读性优化**：清理空段落、规范化表格、保留引用块结构
+- **日志系统**：结构化日志输出，支持 `--verbose` 调试模式
+- **环境变量配置**：无需修改代码即可自定义输出目录、超时等参数
+- **纯 Python**：单文件 + 依赖，无外部二进制依赖
 
-## 依赖
+## 目录结构
+
+```
+wx_article/
+├── __init__.py              # 包入口，暴露 WxArticleExtractor / Config
+├── requirements.txt         # Python 依赖
+├── .gitignore
+└── scripts/
+    └── extract.py           # 核心脚本（CLI + 模块双重入口）
+```
+
+## 依赖安装
 
 ```bash
-pip install beautifulsoup4 requests lxml markdownify
+cd wx_article
+pip install -r requirements.txt
+```
+
+或手动安装：
+
+```bash
+pip install beautifulsoup4 lxml markdownify requests urllib3
 ```
 
 ## 用法
 
-### 方式一：直接调用脚本
+### 方式一：直接调用脚本（CLI）
 
 ```bash
-python skills/wx_article/scripts/extract.py <URL> [--out-dir <目录>] [--no-base64]
+python wx_article/scripts/extract.py "https://mp.weixin.qq.com/s/xxxxx"
 ```
 
-### 方式二：Agent 调用流程
+**常用选项：**
 
-1. 拿到用户提供的文章 URL
-2. 执行提取脚本：
-   ```bash
-   python skills/wx_article/scripts/extract.py "<URL>" --out-dir /root/work/article
-   ```
-3. 向用户返回保存的文件路径和转录统计
+| 选项 | 说明 | 默认值 |
+|---|---|---|
+| `--out-dir <目录>` | 输出目录 | `~/work/wx_articles` |
+| `--no-base64` | 禁用图片 base64 内嵌 | 启用 |
+| `--verbose, -v` | 输出详细调试日志 | 关闭 |
+| `--timeout <秒>` | 请求超时 | 30 |
+| `--retries <次>` | 重试次数 | 3 |
+
+**示例：**
+
+```bash
+# 基础用法
+python wx_article/scripts/extract.py "https://mp.weixin.qq.com/s/xxxxx"
+
+# 指定输出目录
+python wx_article/scripts/extract.py "https://mp.weixin.qq.com/s/xxxxx" --out-dir ./my_articles
+
+# 调试模式
+python wx_article/scripts/extract.py "https://mp.weixin.qq.com/s/xxxxx" --verbose
+
+# 禁用 base64（保留原链接）
+python wx_article/scripts/extract.py "https://mp.weixin.qq.com/s/xxxxx" --no-base64
+```
+
+### 方式二：模块导入（Agent / Python 调用）
+
+```python
+from wx_article.scripts.extract import WxArticleExtractor, Config
+
+# 默认配置
+extractor = WxArticleExtractor()
+path = extractor.extract("https://mp.weixin.qq.com/s/xxxxx")
+print(f"保存到: {path}")
+
+# 自定义配置
+config = Config(
+    out_dir="/tmp/articles",
+    use_base64=False,      # 不转 base64
+    timeout=60,            # 超时 60 秒
+    retries=5,             # 重试 5 次
+)
+extractor = WxArticleExtractor(config)
+result = extractor.extract_sync("https://mp.weixin.qq.com/s/xxxxx")
+print(result["filepath"], result["stats"])
+```
+
+### 方式三：环境变量配置
+
+无需修改代码或传递参数，通过环境变量控制行为：
+
+```bash
+export WX_ARTICLE_OUT_DIR="/data/articles"
+export WX_ARTICLE_TIMEOUT="60"
+export WX_ARTICLE_RETRIES="5"
+python wx_article/scripts/extract.py "https://mp.weixin.qq.com/s/xxxxx"
+```
+
+**支持的环境变量：**
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `WX_ARTICLE_OUT_DIR` | 默认输出目录 | `~/work/wx_articles` |
+| `WX_ARTICLE_TIMEOUT` | 请求超时秒数 | 30 |
+| `WX_ARTICLE_RETRIES` | 重试次数 | 3 |
+
+## 可复制给其他 OpenClaw 使用
+
+### 快速部署步骤
+
+1. **复制 skill 文件到目标 workspace**
+
+```bash
+# 在你的 workspace 下
+cp -r /path/to/wx_article ./
+pip install -r wx_article/requirements.txt
+```
+
+2. **Agent 调用**（OpenClaw 直接执行）
+
+```python
+# Agent 拿到用户提供的文章 URL
+import subprocess
+result = subprocess.run(
+    ["python", "wx_article/scripts/extract.py", url, "--out-dir", "~/work/wx_articles"],
+    capture_output=True, text=True
+)
+print(result.stdout)
+```
+
+3. **导入为模块使用**
+
+```python
+from wx_article.scripts.extract import WxArticleExtractor
+extractor = WxArticleExtractor()
+path = extractor.extract(url)
+```
+
+### 作为 OpenClaw Skill 安装
+
+将以下内容加入 Agent 的 `SKILL.md` 或工具定义：
+
+```yaml
+skill: wx_article
+entry: python {workspace}/wx_article/scripts/extract.py
+env:
+  WX_ARTICLE_OUT_DIR: "{workspace}/wx_articles"
+```
 
 ## 输出格式
 
 ```
-~/work/wx_articles/
-  年-月-日_文章标题_公众号名称.md
+<out_dir>/
+  YYYY-MM-DD_文章标题_公众号名称.md
 ```
 
-文件包含 YAML frontmatter（title、author、date、source、cover）和 Markdown 正文，以及转录统计。
+文件结构：
 
-## 增强特性
+```markdown
+---
+title: 文章标题
+author: 公众号名称
+date: 2026-07-10
+source: https://mp.weixin.qq.com/s/xxxxx
+---
 
-| 特性 | 说明 |
-|---|---|
-| **重试机制** | 3 次指数退避重试，自动处理 429/500/502/503/504 |
-| **验证页检测** | 识别"请在微信客户端打开"等拦截页面，给出明确提示 |
-| **图片 base64 内嵌** | 下载图片并转为 base64 data URI，解决微信防盗链问题 |
-| **视频/GIF 链接保留** | 视频提取为 `[视频] URL` 文本，GIF 保留原链接 |
-| **可读性优化** | 清理空段落、规范化表格、保留引用块结构、智能 span unwrap |
-| **转录统计** | 文件末尾附转换统计数据 |
+# 文章标题
+
+> 来源：公众号名称
+>
+> 时间：2026-07-10
+> 原文：[链接](https://mp.weixin.qq.com/s/xxxxx)
+> 封面：[查看](https://封面图URL)
+
+![封面](https://封面图URL)
+
+（正文 Markdown …）
+
+---
+
+### 转录统计
+
+- 图片 base64 转换：5 张
+- 图片转换失败：1 张
+- 视频链接保留：0 个
+- GIF 保留：2 个
+```
 
 ## 限制
 
 - 微信文章需要公网可访问，不支持需要登录或授权查看的链接
 - 超过 2MB 的图片放弃 base64 转换，保留原链接
 - 复杂的特殊排版（如交互式组件、小程序卡片）会简化处理
+- SSL 握手失败时自动降级到不验证证书模式
 
-## 脚本位置
+## 版本历史
 
-`scripts/extract.py`
+- **v2.0.0** (2026-07-11): 重构为类封装结构，新增日志系统、环境变量配置、异常分级、CLI 完善
+- **v1.1.0** (2026-07-10): 增强版：重试机制、base64 图片内嵌、视频保留、可读性优化
+- **v1.0.0** (2026-07-10): 初始版本，基础提取功能

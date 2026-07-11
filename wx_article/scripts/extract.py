@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 """
-提取微信公众号文章内容并保存为 Markdown 文件。
-增强版：重试机制、图片 base64 内嵌、视频/GIF 链接保留、可读性优化。
+wx_article — 微信公众号文章提取器（OpenClaw Skill 版本）
+
+将微信公众号文章 URL 对应的正文提取为 Markdown 文件保存。
+支持：重试机制、图片 base64 内嵌、视频/GIF 链接保留、可读性优化。
 
 用法:
-    python extract.py <微信文章URL> [--out-dir <目录>] [--no-base64]
+    python extract.py <URL> [--out-dir <目录>] [--no-base64] [--verbose]
+    python -m wx_article.scripts.extract <URL> [选项]
 
-输出:
-    <输出目录>/YYYY-MM-DD_文章标题_公众号名称.md
+环境变量:
+    WX_ARTICLE_OUT_DIR   默认输出目录（覆盖 --out-dir 默认值）
+    WX_ARTICLE_TIMEOUT   请求超时秒数（默认 30）
+    WX_ARTICLE_RETRIES   重试次数（默认 3）
 """
 
-from typing import Optional, Tuple, Dict
+from __future__ import annotations
+
 import argparse
 import base64
+import logging
 import mimetypes
 import os
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -29,8 +39,27 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ── 全局配置 ───────────────────────────────
-DEFAULT_HEADERS = {
+# ═══════════════════════════════════════════════
+# 配置与常量
+# ═══════════════════════════════════════════════
+
+DEFAULT_TIMEOUT = int(os.getenv("WX_ARTICLE_TIMEOUT", "30"))
+DEFAULT_RETRIES = int(os.getenv("WX_ARTICLE_RETRIES", "3"))
+DEFAULT_OUT_DIR = os.getenv("WX_ARTICLE_OUT_DIR", str(Path.home() / "work" / "wx_articles"))
+
+IMAGE_MAX_SIZE = 2 * 1024 * 1024  # 超过 2MB 放弃 base64
+
+WX_VERIFY_PATTERNS: list[str] = [
+    "请在微信客户端打开",
+    "微信安全支付",
+    "访问被拒绝",
+    "Access Denied",
+    "请在手机微信中查看",
+    "需要登录",
+    "此内容被投诉且经审核涉嫌侵权",
+]
+
+DEFAULT_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -50,435 +79,603 @@ DEFAULT_HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
-WX_VERIFY_PATTERNS = [
-    "请在微信客户端打开",
-    "微信安全支付",
-    "访问被拒绝",
-    "Access Denied",
-    "请在手机微信中查看",
-    "需要登录",
-    "此内容被投诉且经审核涉嫌侵权",
-]
-
-IMAGE_MAX_SIZE = 2 * 1024 * 1024  # 超过 2MB 的图片放弃 base64，改存链接
+logger = logging.getLogger("wx_article")
 
 
-def build_session() -> requests.Session:
-    """构建带重试策略的请求会话。"""
-    retry = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+# ═══════════════════════════════════════════════
+# 异常类
+# ═══════════════════════════════════════════════
+
+class WxArticleError(Exception):
+    """提取器基础异常。"""
+    pass
 
 
-def fetch_html(session: requests.Session, url: str) -> str:
-    """获取微信文章 HTML，带重试和验证页检测。"""
-    try:
-        resp = session.get(url, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.SSLError as e:
-        # 某些环境 SSL 握手失败，尝试不验证证书
-        print(f"⚠️ SSL 错误，尝试不验证证书: {e}", file=sys.stderr)
-        resp = session.get(url, timeout=30, verify=False)
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        if resp.status_code == 403:
-            raise RuntimeError(
-                f"HTTP 403: 微信可能已封禁该 IP 或需要验证。{e}"
-            ) from e
-        raise RuntimeError(f"HTTP {resp.status_code}: {e}") from e
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"网络请求失败: {e}") from e
+class NetworkError(WxArticleError):
+    """网络请求失败。"""
+    pass
 
-    html = resp.text
 
-    # 检测微信客户端限制页面
-    for pattern in WX_VERIFY_PATTERNS:
-        if pattern in html:
-            raise RuntimeError(
-                f"微信验证页拦截：检测到「{pattern}」。"
-                f"建议：a) 确认链接是否完整 b) 尝试从已登录微信的浏览器复制链接"
+class VerifyPageError(WxArticleError):
+    """遇到微信验证拦截页。"""
+    pass
+
+
+class ParseError(WxArticleError):
+    """HTML 解析失败。"""
+    pass
+
+
+class ContentNotFoundError(WxArticleError):
+    """未找到文章正文。"""
+    pass
+
+
+# ═══════════════════════════════════════════════
+# 数据模型
+# ═══════════════════════════════════════════════
+
+@dataclass
+class Article:
+    """文章元数据与内容。"""
+    title: str = "未命名文章"
+    pub_time: str = ""
+    nickname: str = ""
+    cover: str = ""
+    body_md: str = ""
+    source_url: str = ""
+
+
+@dataclass
+class Stats:
+    """转录统计。"""
+    images_converted: int = 0
+    images_failed: int = 0
+    videos: int = 0
+    gifs: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "图片 base64 转换": self.images_converted,
+            "图片转换失败": self.images_failed,
+            "视频链接保留": self.videos,
+            "GIF 保留": self.gifs,
+        }
+
+
+@dataclass
+class Config:
+    """运行配置。"""
+    out_dir: Path = field(default_factory=lambda: Path(DEFAULT_OUT_DIR))
+    use_base64: bool = True
+    verbose: bool = False
+    timeout: int = DEFAULT_TIMEOUT
+    retries: int = DEFAULT_RETRIES
+    image_max_size: int = IMAGE_MAX_SIZE
+
+    @classmethod
+    def from_env(cls) -> Config:
+        """从环境变量构建配置。"""
+        return cls(
+            out_dir=Path(os.getenv("WX_ARTICLE_OUT_DIR", DEFAULT_OUT_DIR)),
+            timeout=int(os.getenv("WX_ARTICLE_TIMEOUT", str(DEFAULT_TIMEOUT))),
+            retries=int(os.getenv("WX_ARTICLE_RETRIES", str(DEFAULT_RETRIES))),
+        )
+
+
+# ═══════════════════════════════════════════════
+# 网络层
+# ═══════════════════════════════════════════════
+
+class HttpClient:
+    """带重试和日志的 HTTP 客户端。"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = self._build_session()
+
+    def _build_session(self) -> requests.Session:
+        retry = Retry(
+            total=self.config.retries,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry,
+            pool_connections=10,
+            pool_maxsize=10,
+        )
+        session = requests.Session()
+        session.headers.update(DEFAULT_HEADERS)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def fetch(self, url: str) -> str:
+        """获取页面 HTML，自动处理 SSL 降级。"""
+        logger.info("正在获取: %s", url)
+        try:
+            resp = self.session.get(url, timeout=self.config.timeout)
+            resp.raise_for_status()
+        except requests.exceptions.SSLError as e:
+            logger.warning("SSL 错误，尝试不验证证书: %s", e)
+            resp = self.session.get(url, timeout=self.config.timeout, verify=False)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if hasattr(e.response, "status_code") and e.response.status_code == 403:
+                raise NetworkError(f"HTTP 403: 微信可能已封禁该 IP 或需要验证。{e}") from e
+            raise NetworkError(f"HTTP 错误: {e}") from e
+        except requests.exceptions.RequestException as e:
+            raise NetworkError(f"网络请求失败: {e}") from e
+
+        html = resp.text
+        self._check_verify_page(html)
+        return html
+
+    def download_image(self, url: str) -> Optional[bytes]:
+        """下载图片，返回二进制内容；失败或超限返回 None。"""
+        if not url or not url.startswith(("http://", "https://")):
+            return None
+
+        try:
+            resp = self.session.get(url, timeout=15, stream=True)
+            resp.raise_for_status()
+
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > self.config.image_max_size:
+                logger.debug("图片 %s 超过大小限制，放弃", url[:60])
+                return None
+
+            buf = BytesIO()
+            for chunk in resp.iter_content(chunk_size=8192):
+                buf.write(chunk)
+                if buf.tell() > self.config.image_max_size:
+                    logger.debug("图片 %s 下载中超限，放弃", url[:60])
+                    return None
+            return buf.getvalue()
+        except Exception as e:
+            logger.debug("下载图片失败 %s: %s", url[:60], e)
+            return None
+
+    @staticmethod
+    def _check_verify_page(html: str) -> None:
+        """检测微信验证拦截页。"""
+        for pattern in WX_VERIFY_PATTERNS:
+            if pattern in html:
+                raise VerifyPageError(
+                    f"微信验证页拦截：检测到「{pattern}」。"
+                    "建议：a) 确认链接是否完整 "
+                    "b) 尝试从已登录微信的浏览器复制链接"
+                )
+
+
+# ═══════════════════════════════════════════════
+# 解析与处理层
+# ═══════════════════════════════════════════════
+
+class HtmlParser:
+    """HTML 解析与 Markdown 转换器。"""
+
+    def __init__(self, client: HttpClient, config: Config):
+        self.client = client
+        self.config = config
+
+    def parse(self, html: str, source_url: str) -> tuple[Article, Stats]:
+        """解析 HTML，返回 (Article, Stats)。"""
+        soup = BeautifulSoup(html, "html.parser")
+
+        article = Article(
+            title=self._extract_title(soup, html),
+            pub_time=self._extract_pub_time(soup, html),
+            nickname=self._extract_nickname(soup, html),
+            cover=self._extract_cover(soup),
+            source_url=source_url,
+        )
+
+        content_div = soup.find("div", {"id": "js_content"})
+        if not content_div:
+            raise ContentNotFoundError(
+                "未找到文章正文（js_content），可能页面结构已变更或访问受限。"
             )
 
-    return html
+        # 清理 script/style
+        for tag in content_div.find_all(["script", "style"]):
+            tag.decompose()
 
+        # 处理媒体 → 统计
+        stats = self._process_media(content_div)
 
-def download_image(session: requests.Session, url: str) -> Optional[bytes]:
-    """下载图片，返回二进制内容；失败返回 None。"""
-    if not url or not url.startswith(("http://", "https://")):
-        return None
-    try:
-        resp = session.get(url, timeout=15, stream=True)
-        resp.raise_for_status()
-        # 限制大小
-        content_length = resp.headers.get("Content-Length")
-        if content_length and int(content_length) > IMAGE_MAX_SIZE:
-            return None  # 太大放弃
-        buf = BytesIO()
-        for chunk in resp.iter_content(chunk_size=8192):
-            buf.write(chunk)
-            if buf.tell() > IMAGE_MAX_SIZE:
-                return None
-        return buf.getvalue()
-    except Exception:
-        return None
+        # 可读性预处理
+        self._normalize_content(content_div)
 
+        # HTML → Markdown
+        body_md = md(
+            str(content_div),
+            heading_style="ATX",
+            strip=["script", "style"],
+        )
 
-def image_to_base64(data: bytes, url: str) -> str:
-    """将图片二进制转为 base64 data URI。"""
-    mime, _ = mimetypes.guess_type(url)
-    if not mime:
-        mime = "image/jpeg"
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{mime};base64,{b64}"
+        article.body_md = self._clean_markdown(body_md)
+        return article, stats
 
+    # ── 元数据提取 ───────────────────────────
 
-def normalize_content_for_markdownify(content_div: BeautifulSoup):
-    """在 markdownify 前预处理 HTML，提升可读性。"""
-    # 1. 删除注释
-    for comment in content_div.find_all(string=lambda t: isinstance(t, Comment)):
-        comment.extract()
+    def _extract_title(self, soup: BeautifulSoup, html: str) -> str:
+        title_tag = soup.find("h2", {"id": "activity_name"})
+        title = title_tag.get_text(strip=True) if title_tag else ""
+        if not title:
+            og = soup.find("meta", {"property": "og:title"})
+            title = og.get("content", "").strip() if og else ""
+        return title or "未命名文章"
 
-    # 2. 处理 section 标签：微信用 <section> 做卡片，拆成段落
-    for section in content_div.find_all("section"):
-        section.name = "div"
+    def _extract_pub_time(self, soup: BeautifulSoup, html: str) -> str:
+        time_tag = soup.find("em", {"id": "publish_time"})
+        pub_time = time_tag.get_text(strip=True) if time_tag else ""
+        if not pub_time:
+            m = re.search(r'var\s+publish_time\s*=\s*["\']([^"\']+)["\'];', html)
+            pub_time = m.group(1).strip() if m else ""
+        if not pub_time:
+            m = re.search(r'(20[0-9]{2}-[0-9]{1,2}-[0-9]{1,2})', html[:50000])
+            pub_time = m.group(1) if m else ""
+        return pub_time
 
-    # 3. 处理引用块：微信引用通常是 blockquote
-    for bq in content_div.find_all("blockquote"):
-        # 保留内部文本，blockquote 本身 markdownify 会正确转 > 
-        pass
+    def _extract_nickname(self, soup: BeautifulSoup, html: str) -> str:
+        nick_tag = soup.find("a", {"id": "js_name"})
+        nickname = nick_tag.get_text(strip=True) if nick_tag else ""
+        if not nickname:
+            profile = soup.find("span", {"class": "profile_nickname"})
+            nickname = profile.get_text(strip=True) if profile else ""
+        if not nickname:
+            m = re.search(r'var\s+nickname\s*=\s*["\']([^"\']+)["\'];', html)
+            nickname = m.group(1).strip() if m else ""
+        if not nickname:
+            og = soup.find("meta", {"property": "og:description"})
+            nickname = og.get("content", "").strip() if og else ""
+        return nickname
 
-    # 4. 处理 strong/b 合并：去掉无意义的 span wrapper
-    for span in content_div.find_all("span"):
-        if not span.attrs:
-            # 无属性的 span 通常无意义，unwrap
-            span.unwrap()
-        elif set(span.attrs.keys()) == {"style"} and "color" in span.get("style", ""):
-            # 带颜色样式的 span，保留用于 markdownify 可能忽略 color，但保留结构
-            pass
+    def _extract_cover(self, soup: BeautifulSoup) -> str:
+        og = soup.find("meta", {"property": "og:image"})
+        return og.get("content", "").strip() if og else ""
 
-    # 5. 处理 p 标签内 br 造成的空段落：连续 br 可能导致 markdownify 产生空行
-    for p in content_div.find_all("p"):
-        if not p.get_text(strip=True) and not p.find(["img", "video", "iframe"]):
-            p.decompose()
+    # ── 媒体处理 ─────────────────────────────
 
-    # 6. 表格增强：微信表格常带 style，给表格加 thead/tbody 结构提示
-    for table in content_div.find_all("table"):
-        # 如果第一行全是 th，确认 thead 结构
-        first_row = table.find("tr")
-        if first_row:
-            cells = first_row.find_all(["td", "th"])
-            if cells and all(cell.name == "td" for cell in cells):
-                # td 当 th 用的情况，微信常见
+    def _process_media(self, content_div: BeautifulSoup) -> Stats:
+        stats = Stats()
+
+        # 图片
+        for img in content_div.find_all("img"):
+            src = img.get("data-src") or img.get("src") or ""
+            if not src:
+                img.decompose()
+                continue
+
+            # 清理多余属性
+            for key in list(img.attrs.keys()):
+                if key not in ("src", "alt", "title"):
+                    del img.attrs[key]
+
+            # base64 转换
+            if self.config.use_base64 and src.startswith("http"):
+                data = self.client.download_image(src)
+                if data:
+                    img["src"] = self._bytes_to_base64(data, src)
+                    stats.images_converted += 1
+                    logger.debug("图片转 base64 成功: %s", src[:60])
+                else:
+                    stats.images_failed += 1
+                    img["src"] = src
+                    logger.debug("图片转 base64 失败，保留链接: %s", src[:60])
+            else:
+                img["src"] = src
+
+            if not img.get("alt"):
+                img["alt"] = "图片"
+
+            if img.get("src", "").lower().endswith(".gif"):
+                stats.gifs += 1
+
+        # 视频（iframe / video）
+        for tag_name in ("iframe", "video"):
+            for tag in content_div.find_all(tag_name):
+                src = tag.get("data-src") or tag.get("src") or ""
+                if src:
+                    placeholder = content_div.new_tag("p")
+                    placeholder.string = f"[视频] {src}"
+                    tag.replace_with(placeholder)
+                    stats.videos += 1
+                else:
+                    tag.decompose()
+
+        return stats
+
+    @staticmethod
+    def _bytes_to_base64(data: bytes, url: str) -> str:
+        mime, _ = mimetypes.guess_type(url)
+        mime = mime or "image/jpeg"
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    # ── 可读性预处理 ─────────────────────────
+
+    @staticmethod
+    def _normalize_content(content_div: BeautifulSoup) -> None:
+        # 删除注释
+        for comment in content_div.find_all(string=lambda t: isinstance(t, Comment)):
+            comment.extract()
+
+        # section → div
+        for section in content_div.find_all("section"):
+            section.name = "div"
+
+        # 无意义 span unwrap
+        for span in content_div.find_all("span"):
+            if not span.attrs:
+                span.unwrap()
+
+        # 空段落清理
+        for p in content_div.find_all("p"):
+            if not p.get_text(strip=True) and not p.find(["img", "iframe", "table", "blockquote"]):
+                p.decompose()
+
+        # 表格首行 td → th
+        for table in content_div.find_all("table"):
+            first_row = table.find("tr")
+            if first_row:
+                cells = first_row.find_all("td")
                 for cell in cells:
                     cell.name = "th"
 
-    # 7. 清理空的 div
-    for div in content_div.find_all("div"):
-        if not div.get_text(strip=True) and not div.find(["img", "video", "iframe", "table", "blockquote"]):
-            div.decompose()
+        # 空 div 清理
+        for div in list(content_div.find_all("div")):
+            if not div.get_text(strip=True) and not div.find(["img", "iframe", "table", "blockquote"]):
+                div.decompose()
+
+    # ── Markdown 后处理 ──────────────────────
+
+    @staticmethod
+    def _clean_markdown(md_text: str) -> str:
+        md_text = md_text.replace("\\*", "*").replace("\\_", "_")
+        md_text = re.sub(r"\n{4,}", "\n\n\n", md_text)
+        md_text = re.sub(r"^(?![ ]{4}|```)( )+", "", md_text, flags=re.MULTILINE)
+        return md_text
 
 
-def process_media(session: requests.Session, content_div: BeautifulSoup, use_base64: bool):
-    """处理图片、视频、GIF。"""
-    stats = {"images_converted": 0, "images_failed": 0, "videos": 0, "gifs": 0}
+# ═══════════════════════════════════════════════
+# 输出层
+# ═══════════════════════════════════════════════
 
-    # ── 图片处理 ──
-    for img in content_div.find_all("img"):
-        src = img.get("data-src") or img.get("src") or ""
-        if not src:
-            img.decompose()
-            continue
+class MarkdownWriter:
+    """Markdown 文件写入器。"""
 
-        # 清理属性
-        for key in list(img.attrs.keys()):
-            if key not in ("src", "alt", "title"):
-                del img.attrs[key]
+    def __init__(self, config: Config):
+        self.config = config
 
-        # base64 转换
-        if use_base64 and src.startswith("http"):
-            data = download_image(session, src)
-            if data:
-                img["src"] = image_to_base64(data, src)
-                stats["images_converted"] += 1
-            else:
-                stats["images_failed"] += 1
-                # 失败保留原链接
-                img["src"] = src
+    def write(self, article: Article, stats: Stats) -> Path:
+        """生成并保存 Markdown 文件，返回保存路径。"""
+        pub_time = article.pub_time
+        if pub_time:
+            try:
+                dt = datetime.strptime(pub_time, "%Y-%m-%d")
+                date_prefix = dt.strftime("%Y-%m-%d")
+            except ValueError:
+                date_prefix = datetime.now().strftime("%Y-%m-%d")
         else:
-            img["src"] = src
+            date_prefix = datetime.now().strftime("%Y-%m-%d")
 
-        if not img.get("alt"):
-            img["alt"] = "图片"
+        safe_title = self._sanitize(article.title)
+        safe_nickname = self._sanitize(article.nickname)
 
-    # ── 视频处理（iframe / video 标签）─
-    for iframe in content_div.find_all("iframe"):
-        src = iframe.get("data-src") or iframe.get("src") or ""
-        if src:
-            placeholder = content_div.new_tag("p")
-            placeholder.string = f"[视频] {src}"
-            iframe.replace_with(placeholder)
-            stats["videos"] += 1
-        else:
-            iframe.decompose()
-
-    for video in content_div.find_all("video"):
-        src = video.get("data-src") or video.get("src") or ""
-        if src:
-            placeholder = content_div.new_tag("p")
-            placeholder.string = f"[视频] {src}"
-            video.replace_with(placeholder)
-            stats["videos"] += 1
-        else:
-            video.decompose()
-
-    # ── GIF 处理（通常是 img，但可能带 data-type="gif"）─
-    for img in content_div.find_all("img"):
-        # 已经处理过 src，检查是否是 gif
-        if img.get("src", "").lower().endswith(".gif"):
-            stats["gifs"] += 1
-
-    return stats
-
-
-def extract_article(session: requests.Session, html: str, source_url: str, use_base64: bool) -> Tuple[dict, dict]:
-    """从 HTML 中提取文章元数据和正文，返回 (article_dict, stats)。"""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # ── 标题 ──
-    title_tag = soup.find("h2", {"id": "activity_name"})
-    title = title_tag.get_text(strip=True) if title_tag and title_tag.get_text(strip=True) else ""
-    if not title:
-        og_title = soup.find("meta", {"property": "og:title"})
-        if og_title:
-            title = og_title.get("content", "").strip()
-    if not title:
-        title = "未命名文章"
-
-    # ── 封面图 ──
-    cover = ""
-    og_image = soup.find("meta", {"property": "og:image"})
-    if og_image:
-        cover = og_image.get("content", "").strip()
-
-    # ── 发布时间 ──
-    pub_time = ""
-    time_tag = soup.find("em", {"id": "publish_time"})
-    if time_tag:
-        pub_time = time_tag.get_text(strip=True)
-    if not pub_time:
-        m = re.search(r'var\s+publish_time\s*=\s*["\']([^"\']+)["\'];', html)
-        if m:
-            pub_time = m.group(1).strip()
-    if not pub_time:
-        m = re.search(r'(20[0-9]{2}-[0-9]{1,2}-[0-9]{1,2})', html[:50000])
-        if m:
-            pub_time = m.group(1)
-
-    # ── 公众号名称 ──
-    nickname = ""
-    nick_tag = soup.find("a", {"id": "js_name"})
-    if nick_tag:
-        nickname = nick_tag.get_text(strip=True)
-    if not nickname:
-        profile = soup.find("span", {"class": "profile_nickname"})
-        if profile:
-            nickname = profile.get_text(strip=True)
-    if not nickname:
-        # 尝试从微信文章 script 变量提取
-        m = re.search(r'var\s+nickname\s*=\s*["\']([^"\']+)["\'];', html)
-        if m:
-            nickname = m.group(1).strip()
-    if not nickname:
-        og_desc = soup.find("meta", {"property": "og:description"})
-        if og_desc:
-            nickname = og_desc.get("content", "").strip()
-
-    # ── 正文容器 ──
-    content_div = soup.find("div", {"id": "js_content"})
-    if not content_div:
-        raise RuntimeError(
-            "未找到文章正文（js_content），可能页面结构已变更或访问受限。"
+        filename = (
+            f"{date_prefix}_{safe_title}_{safe_nickname}.md"
+            if safe_nickname
+            else f"{date_prefix}_{safe_title}.md"
         )
 
-    # 清理 script/style
-    for tag in content_div.find_all(["script", "style"]):
-        tag.decompose()
+        out_path = self.config.out_dir / filename
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 处理媒体
-    stats = process_media(session, content_div, use_base64)
+        lines = self._build_lines(article, stats, date_prefix)
+        out_path.write_text("\n".join(lines), encoding="utf-8")
 
-    # 可读性预处理
-    normalize_content_for_markdownify(content_div)
+        logger.info("已保存: %s", out_path)
+        return out_path
 
-    # HTML → Markdown
-    body_md = md(
-        str(content_div),
-        heading_style="ATX",
-        strip=["script", "style"],
-    )
+    def _build_lines(
+        self, article: Article, stats: Stats, fallback_date: str
+    ) -> list[str]:
+        lines: list[str] = [
+            "---",
+            f"title: {article.title}",
+            f"author: {article.nickname}",
+            f"date: {article.pub_time or fallback_date}",
+            f"source: {article.source_url}",
+            "---",
+            "",
+            f"# {article.title}",
+            "",
+        ]
 
-    # 清理 markdownify 产生的过度转义和格式问题
-    body_md = body_md.replace("\\*", "*").replace("\\_", "_")
-    # 清理连续的换行（超过 2 个换行保留 2 个）
-    body_md = re.sub(r"\n{4,}", "\n\n\n", body_md)
-    # 清理行首多余空格（影响代码块以外的渲染）
-    body_md = re.sub(r"^(?![ ]{4}|```)( )+", "", body_md, flags=re.MULTILINE)
+        if article.nickname:
+            lines.append(f"> 来源：{article.nickname}")
+            lines.append(">")
 
-    article = {
-        "title": title,
-        "pub_time": pub_time,
-        "nickname": nickname,
-        "cover": cover,
-        "body_md": body_md,
-        "source_url": source_url,
-    }
-    return article, stats
+        lines.append(f"> 时间：{article.pub_time or fallback_date}")
+        lines.append(f"> 原文：[链接]({article.source_url})")
 
+        if article.cover:
+            lines.append(f"> 封面：[查看]({article.cover})")
+            lines.append("")
+            lines.append(f"![封面]({article.cover})")
 
-def sanitize_filename(name: str) -> str:
-    """将标题转为安全的文件名。"""
-    name = name.strip().replace(" ", "_")
-    # 保留中英文、数字、下划线、连字符，其余替换
-    name = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9_\-]", "_", name)
-    name = re.sub(r"_+", "_", name)
-    name = name.strip("_")
-    return name or "article"
-
-
-def save_markdown(article: dict, out_dir: str, stats: dict) -> str:
-    """生成并保存 Markdown 文件。"""
-    pub_time = article["pub_time"]
-    if pub_time:
-        try:
-            dt = datetime.strptime(pub_time, "%Y-%m-%d")
-            date_prefix = dt.strftime("%Y-%m-%d")
-        except ValueError:
-            date_prefix = datetime.now().strftime("%Y-%m-%d")
-    else:
-        date_prefix = datetime.now().strftime("%Y-%m-%d")
-
-    safe_title = sanitize_filename(article["title"])
-    safe_nickname = sanitize_filename(article["nickname"])
-    filename = f"{date_prefix}_{safe_title}_{safe_nickname}.md" if safe_nickname else f"{date_prefix}_{safe_title}.md"
-    filepath = os.path.join(out_dir, filename)
-    os.makedirs(out_dir, exist_ok=True)
-
-    # 封面图（如有）
-    cover_md = f"\n![封面]({article['cover']})\n" if article.get("cover") else ""
-
-    # 构建正文
-    lines = [
-        "---",
-        f"title: {article['title']}",
-        f"author: {article['nickname']}",
-        f"date: {article['pub_time']}",
-        f"source: {article['source_url']}",
-        "---",
-        "",
-        f"# {article['title']}",
-        "",
-    ]
-
-    if article["nickname"]:
-        lines.append(f"> 来源：{article['nickname']}")
-        lines.append(">")
-    lines.append(f"> 时间：{article['pub_time'] or date_prefix}")
-    lines.append(f"> 原文：[链接]({article['source_url']})")
-    if article.get("cover"):
-        lines.append(f"> 封面：[查看]({article['cover']})")
-    lines.append("")
-    lines.append(cover_md.strip())
-    if cover_md:
         lines.append("")
-    lines.append(article["body_md"])
-    lines.append("")
+        lines.append(article.body_md)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("### 转录统计")
+        lines.append("")
 
-    # 转录统计
-    lines.append("---")
-    lines.append("")
-    lines.append("### 转录统计")
-    lines.append("")
-    lines.append(f"- 图片 base64 转换：{stats['images_converted']} 张")
-    lines.append(f"- 图片转换失败：{stats['images_failed']} 张")
-    lines.append(f"- 视频链接保留：{stats['videos']} 个")
-    lines.append(f"- GIF 保留：{stats['gifs']} 个")
-    lines.append("")
+        for key, val in stats.as_dict().items():
+            lines.append(f"- {key}：{val}")
 
-    md_content = "\n".join(lines)
+        lines.append("")
+        return lines
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(md_content)
-
-    return filepath
+    @staticmethod
+    def _sanitize(name: str) -> str:
+        name = name.strip().replace(" ", "_")
+        name = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9_\-]", "_", name)
+        name = re.sub(r"_+", "_", name).strip("_")
+        return name or "article"
 
 
-def main():
+# ═══════════════════════════════════════════════
+# 主控层
+# ═══════════════════════════════════════════════
+
+class WxArticleExtractor:
+    """微信文章提取器主控类。"""
+
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or Config.from_env()
+        self.client = HttpClient(self.config)
+        self.parser = HtmlParser(self.client, self.config)
+        self.writer = MarkdownWriter(self.config)
+
+    def extract(self, url: str) -> Path:
+        """执行完整提取流程，返回输出文件路径。"""
+        logger.info("开始提取: %s", url)
+        t0 = time.perf_counter()
+
+        html = self.client.fetch(url)
+        article, stats = self.parser.parse(html, url)
+        out_path = self.writer.write(article, stats)
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "完成: title=%s nickname=%s images=%d/%d videos=%d time=%.2fs",
+            article.title,
+            article.nickname or "未知",
+            stats.images_converted,
+            stats.images_failed,
+            stats.videos,
+            elapsed,
+        )
+        return out_path
+
+    def extract_sync(self, url: str) -> dict:
+        """同步提取，返回结构化结果（供 Agent 调用）。"""
+        html = self.client.fetch(url)
+        article, stats = self.parser.parse(html, url)
+        out_path = self.writer.write(article, stats)
+        return {
+            "success": True,
+            "filepath": str(out_path),
+            "title": article.title,
+            "nickname": article.nickname,
+            "pub_time": article.pub_time,
+            "stats": stats.as_dict(),
+        }
+
+
+# ═══════════════════════════════════════════════
+# CLI 入口
+# ═══════════════════════════════════════════════
+
+def setup_logging(verbose: bool = False) -> None:
+    """配置日志输出。"""
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    logging.basicConfig(level=level, format=fmt, stream=sys.stderr)
+
+
+def main() -> int:
+    """命令行入口。"""
     parser = argparse.ArgumentParser(
-        description="提取微信公众号文章为 Markdown（增强版）",
+        prog="wx_article",
+        description="提取微信公众号文章为 Markdown（OpenClaw Skill 版本）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+环境变量:
+  WX_ARTICLE_OUT_DIR    默认输出目录（默认: ~/work/wx_articles）
+  WX_ARTICLE_TIMEOUT    请求超时秒数（默认: 30）
+  WX_ARTICLE_RETRIES    重试次数（默认: 3）
+
 示例:
   python extract.py "https://mp.weixin.qq.com/s/xxxxx"
   python extract.py "https://mp.weixin.qq.com/s/xxxxx" --out-dir ./articles --no-base64
+  WX_ARTICLE_OUT_DIR=/tmp/articles python extract.py "https://mp.weixin.qq.com/s/xxxxx"
         """,
     )
-    parser.add_argument("url", help="微信公众号文章链接")
+    parser.add_argument("url", help="微信公众号文章链接（mp.weixin.qq.com）")
     parser.add_argument(
         "--out-dir",
-        default=os.path.expanduser("~/work/wx_articles"),
-        help="输出目录（默认: ~/work/wx_articles）",
+        default=DEFAULT_OUT_DIR,
+        help=f"输出目录（默认: {DEFAULT_OUT_DIR}）",
     )
     parser.add_argument(
         "--no-base64",
         action="store_true",
         help="禁用图片 base64 内嵌，保留原始链接",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="输出详细日志",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"请求超时秒数（默认: {DEFAULT_TIMEOUT}）",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help=f"重试次数（默认: {DEFAULT_RETRIES}）",
+    )
+
     args = parser.parse_args()
 
     if not args.url.startswith(("http://", "https://")):
         print("错误: URL 必须以 http:// 或 https:// 开头", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
-    session = build_session()
-    use_base64 = not args.no_base64
+    setup_logging(args.verbose)
 
-    t0 = time.perf_counter()
-    print(f"🌐 正在获取: {args.url}")
+    config = Config(
+        out_dir=Path(args.out_dir),
+        use_base64=not args.no_base64,
+        verbose=args.verbose,
+        timeout=args.timeout,
+        retries=args.retries,
+    )
+
+    extractor = WxArticleExtractor(config)
 
     try:
-        html = fetch_html(session, args.url)
-    except RuntimeError as e:
-        print(f"❌ 获取失败: {e}", file=sys.stderr)
-        sys.exit(2)
-
-    print("📄 正在解析文章...")
-    try:
-        article, stats = extract_article(session, html, args.url, use_base64)
-    except RuntimeError as e:
-        print(f"❌ 解析失败: {e}", file=sys.stderr)
-        sys.exit(3)
-
-    print(f"   标题: {article['title']}")
-    print(f"   公众号: {article['nickname'] or '未知'}")
-    print(f"   发布时间: {article['pub_time'] or '未知'}")
-    if article.get("cover"):
-        print(f"   封面: {article['cover'][:80]}...")
-    print(f"   图片 base64 转换: {stats['images_converted']} / 失败: {stats['images_failed']}")
-    print(f"   视频保留: {stats['videos']} | GIF: {stats['gifs']}")
-
-    filepath = save_markdown(article, args.out_dir, stats)
-    elapsed = time.perf_counter() - t0
-    print(f"✅ 已保存: {filepath}  (耗时 {elapsed:.2f}s)")
+        out_path = extractor.extract(args.url)
+        print(f"✅ 已保存: {out_path}")
+        return 0
+    except VerifyPageError as e:
+        logger.error("验证页拦截: %s", e)
+        print(f"❌ {e}", file=sys.stderr)
+        return 2
+    except NetworkError as e:
+        logger.error("网络错误: %s", e)
+        print(f"❌ {e}", file=sys.stderr)
+        return 3
+    except (ParseError, ContentNotFoundError) as e:
+        logger.error("解析错误: %s", e)
+        print(f"❌ {e}", file=sys.stderr)
+        return 4
+    except Exception as e:
+        logger.exception("未知错误: %s", e)
+        print(f"❌ 未知错误: {e}", file=sys.stderr)
+        return 5
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
